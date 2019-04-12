@@ -1,0 +1,138 @@
+#!/bin/bash
+
+# deb dep: wget xmlsec1 xsltproc openssl coreutils 
+
+# stylesheet to extract signing certificate, maybe xmllint --xpath
+# will be more elegant solution?
+MD_SIGNER="<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<xsl:stylesheet
+  xmlns=\"urn:oasis:names:tc:SAML:2.0:metadata\"
+  xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"
+  xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"
+  version=\"1.0\">
+
+  <xsl:strip-space elements=\"*\" />
+  <xsl:output method=\"text\"/>
+
+  <xsl:template match=\"/\"><xsl:apply-templates select=\"//*/ds:Signature/ds:KeyInfo/ds:X509Data/ds:X509Certificate\"/>
+</xsl:template>
+</xsl:stylesheet>
+";
+
+MD_VALIDUNTIL="<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<xsl:stylesheet
+  xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\"
+  xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"
+  xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"
+  version=\"1.0\">
+
+  <xsl:strip-space elements=\"*\" />
+  <xsl:output method=\"text\"/>
+
+  <xsl:template match=\"/\">
+    <xsl:apply-templates/>
+  </xsl:template>
+
+  <xsl:template match=\"md:EntitiesDescriptor\">
+    <xsl:value-of select=\"@validUntil\"/>
+    
+  </xsl:template>
+</xsl:stylesheet>
+"
+
+while getopts ":M:C:S:w:c:" opt
+do
+	case $opt in
+		M)	METADATA="${OPTARG}"
+			;;
+		C)	CA_CERT="${OPTARG}"
+			;;
+		S)	SIGNER="${OPTARG}"
+			;;
+		w)	WARN_VALID="${OPTARG}"
+			;;
+		c)	MIN_VALID="${OPTARG}"
+			;;
+        esac
+done
+
+
+XMLSEC1=/usr/bin/xmlsec1
+BASE64='/usr/bin/base64 -d'
+XSLTPROC=/usr/bin/xsltproc
+
+METADATA_TMP=`mktemp /tmp/check_metadata_XXXXXX`
+OUTPUT_TMP=`mktemp /tmp/check_metadata_XXXXXX`
+
+wget --no-check-certificate $METADATA -O $METADATA_TMP >$OUTPUT_TMP 2>&1
+if [ $? != 0 ]
+then
+  echo -n "wget failed to download $METADATA: ";
+  cat $OUTPUT_TMP | grep -v '^ *$' | tail -1
+  rm $METADATA_TMP $OUTPUT_TMP >/dev/null 2>&1
+  exit 2;
+fi
+
+$XMLSEC1 --verify --id-attr:ID urn:oasis:names:tc:SAML:2.0:metadata:EntitiesDescriptor --trusted-pem $CA_CERT $METADATA_TMP >$OUTPUT_TMP 2>&1
+if [ $? != 0 ]
+then
+  echo -n "XMLSIG verification failed: ";
+  cat $OUTPUT_TMP | grep -B 25 '^Usage' | grep -v '^Usage'
+  rm $METADATA_TMP $OUTPUT_TMP >/dev/null 2>&1
+  exit 2;
+fi
+
+SIGNED_BY_CRT=`mktemp /tmp/check_metadata_XXXXXX`
+echo "$MD_SIGNER" | $XSLTPROC - $METADATA_TMP 2>$OUTPUT_TMP >$SIGNED_BY_CRT
+if [ $? != 0 ]
+then
+  echo -n "failed to get signer certificate: ";
+  cat $OUTPUT_TMP | grep -v '^ *$' | tail -1
+  rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
+  exit 2;
+fi
+
+# Nejake starsi verze xmlsec1 mely bug spocivajici v tom ze se
+# spokojily s overenim jakymkoliv certifikatem ktery dokazal program
+# najit, tj. kaslaly na ten prpinac --trusted-pem proto je tady i
+# tahle kontrola i kdyz je u novych opravenych verzi skoro
+# duplicitni. To ze je xmlsec opraveny jsem testoval na xmlsec1 1.2.14
+# (openssl)
+
+#SIGNED_BY=`cat $SIGNED_BY_CRT | $BASE64 | openssl x509 -inform der -noout -subject | sed "s/subject= *//"`
+SIGNED_BY=$(cat $SIGNED_BY_CRT | $BASE64 | openssl x509 -inform der -noout -subject | sed -e "s; ;;g" -e "s;^subject=;;g" )
+if [ "x$SIGNED_BY" != "x$SIGNER" ]
+then
+  echo "Signed by $SIGNED_BY expecting $SIGNER";
+  rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
+  exit 2;
+fi
+
+VALID_UNTIL=`echo "$MD_VALIDUNTIL" | $XSLTPROC - $METADATA_TMP 2>$OUTPUT_TMP`
+if [ $? != 0 ]
+then
+  echo -n "failed to get validUntil attr: ";
+  cat $OUTPUT_TMP | grep -v '^ *$' | tail -1
+  rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
+  exit 2;
+fi
+
+NOW=`date -u "+%Y-%m-%dT%H:%M:%SZ" --date="$MIN_VALID days"`
+WEEK=`date -u "+%Y-%m-%dT%H:%M:%SZ" --date="$WARN_VALID days"`
+
+if [[ $NOW > $VALID_UNTIL ]]
+then
+  echo "Metadata are about to expire in $MIN_VALID or less days, they are valid until $VALID_UNTIL.";
+  rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
+  exit 2;
+fi
+
+if [[ $WEEK > $VALID_UNTIL ]]
+then
+  echo "Metadata are about to expire in $WARN_VALID or less days, they are valid until $VALID_UNTIL.";
+  rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
+  exit 1;
+fi
+
+echo "Valid until $VALID_UNTIL"
+rm $METADATA_TMP $OUTPUT_TMP $SIGNED_BY_CRT>/dev/null 2>&1
